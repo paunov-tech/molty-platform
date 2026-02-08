@@ -1,0 +1,8 @@
+molty-key.json
+migrate.py
+__pycache__/
+tehicki_listovi/
+*.pyc
+node_modules/
+app.py
+*.xlsx
