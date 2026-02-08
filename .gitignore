@@ -1,8 +1,9 @@
 molty-key.json
 migrate.py
+app.py
 __pycache__/
-tehicki_listovi/
 *.pyc
 node_modules/
-app.py
+tehicki_listovi/
+*.dxf
 *.xlsx
