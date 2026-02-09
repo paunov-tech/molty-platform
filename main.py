@@ -4,11 +4,9 @@ from pydantic import BaseModel
 from typing import List
 import uvicorn
 import os
-import re
-import PyPDF2
 import math
 
-app = FastAPI(title="MOLTY ULTIMATE")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,54 +14,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# --- MATERIJALI ---
-CURRENT_DIR = os.getcwd()
-PDF_FOLDER = os.path.join(CURRENT_DIR, "tehnicki_listovi")
-
-def estimate_price(name, density):
-    name_upper = name.upper()
-    if "INSUL" in name_upper: return 450.0 
-    if density > 2800: return 1200.0 
-    if "CAST" in name_upper: return 850.0 
-    return 600.0 
-
-def scan_local_materials():
-    materials = []
-    if not os.path.exists(PDF_FOLDER):
-        return [
-            {"name": "CALDE CAST F 60", "category": "working", "density": 2450, "lambda_val": 1.6, "price": 950},
-            {"name": "CALDE INSUL 1000", "category": "insulation", "density": 800, "lambda_val": 0.2, "price": 450}
-        ]
-    
-    for filename in os.listdir(PDF_FOLDER):
-        if filename.lower().endswith(".pdf"):
-            mat_name = filename.replace(".pdf", "").replace(".PDF", "").replace("_", " ")
-            category, lambda_val, density = "working", 1.5, 2400
-            try:
-                reader = PyPDF2.PdfReader(os.path.join(PDF_FOLDER, filename))
-                if len(reader.pages) > 0:
-                    text = reader.pages[0].extract_text() or ""
-                    dm = re.search(r"(\d+[.,]\d+)\s*(g/cm3|kg/dm3)", text)
-                    if dm:
-                        val = float(dm.group(1).replace(",", "."))
-                        density = val * 1000 if val < 10 else val
-                    if density < 1600 or "INSUL" in text.upper():
-                        category = "insulation"
-                        lambda_val = 0.2
-            except: pass
-            
-            materials.append({
-                "name": mat_name, 
-                "category": category, 
-                "density": int(density), 
-                "lambda_val": round(lambda_val, 2),
-                "price": estimate_price(mat_name, density)
-            })
-    materials.sort(key=lambda x: x["name"])
-    return materials
-
-CACHED_MATERIALS = scan_local_materials()
 
 # --- MODELI ---
 class LayerInput(BaseModel):
@@ -73,121 +23,121 @@ class LayerInput(BaseModel):
     density: float
     price: float 
 
-class SimulationRequest(BaseModel):
+class GeometryReq(BaseModel):
+    type: str       # "cylinder" ili "flat"
+    dim1: float     # Dužina (m) ILI Površina (m2)
+    dim2: float     # Svetli Otvor (mm) - samo za cilindar
+
+class SimReq(BaseModel):
     target_temp: int
     ambient_temp: int
     layers: List[LayerInput]
-    
-    # GEOMETRIJA
-    shape: str       # "cylinder", "flat", "cone"...
-    dim1: float      # Dužina (mm) ILI Površina (m2) ako je flat
-    dim2: float      # Svetli Otvor (mm) - samo za cilindre
+    geometry: GeometryReq
 
-@app.get("/api/materials")
-def get_materials():
-    return CACHED_MATERIALS
-
+# --- PRORAČUN ---
 @app.post("/api/simulate")
-def calculate(req: SimulationRequest):
-    # 1. TERMIKA
-    total_resistance = 0.1
-    analyzed_layers = []
+def calc(req: SimReq):
+    # 1. TERMIKA (Zajednička za sve)
+    total_r = 0.1
+    for l in req.layers:
+        total_r += (l.thickness/1000.0) / (l.lambda_val if l.lambda_val>0 else 1)
     
-    for layer in req.layers:
-        d_m = layer.thickness / 1000.0
-        lam = layer.lambda_val if layer.lambda_val > 0 else 1.0
-        r_th = d_m / lam
-        total_resistance += r_th
-        analyzed_layers.append(layer.dict())
+    dt = req.target_temp - req.ambient_temp
+    flux = round(dt / total_r, 2)
+    
+    # Profil T
+    curr = req.target_temp
+    prof = [{"pos":0, "temp":curr}]
+    acc = 0
+    for l in req.layers:
+        r = (l.thickness/1000.0)/(l.lambda_val if l.lambda_val>0 else 1)
+        curr -= flux * r
+        acc += l.thickness
+        prof.append({"pos":acc, "temp":round(curr)})
+    
+    shell_t = round(curr, 1)
 
-    delta_t = req.target_temp - req.ambient_temp
-    heat_flux = round(delta_t / total_resistance, 2)
+    # 2. GEOMETRIJA (RAZDVOJENA LOGIKA)
+    bom = []
+    tot_w = 0
+    tot_c = 0
     
-    curr_t = req.target_temp
-    profile = [{"pos": 0, "temp": round(curr_t)}]
-    acc_th = 0
-    for l in analyzed_layers:
-        r_val = (l["thickness"]/1000.0) / (l["lambda_val"] if l["lambda_val"]>0 else 1)
-        curr_t -= heat_flux * r_val
-        acc_th += l["thickness"]
-        profile.append({"pos": acc_th, "temp": round(curr_t)})
-    shell_temp = round(curr_t, 1)
-
-    # 2. GEOMETRIJA (RAZLIKOVANJE OBLIKA)
-    bill_of_materials = []
-    total_weight = 0
-    total_cost = 0
-    
-    # Promenljive za cilindar
-    L_m = req.dim1 / 1000.0 # Dužina u metrima
-    current_ID_mm = req.dim2 # Svetli otvor u mm
-    
-    # Promenljiva za Flat
-    Flat_Area_m2 = req.dim1 # Ovde dim1 glumim površinu u m2
-    
-    final_shell_diameter = 0
-
-    for layer in analyzed_layers:
-        d_mm = layer["thickness"]
-        d_m = d_mm / 1000.0
+    # Ako je CILINDAR
+    if req.geometry.type == "cylinder":
+        L_m = req.geometry.dim1
+        curr_ID_mm = req.geometry.dim2 # Svetli otvor
         
-        vol_m3 = 0
-        ID_disp = 0
-        OD_disp = 0
-
-        if req.shape == "cylinder":
-            # CILINDAR (Inside-Out)
-            ID_mm = current_ID_mm
-            OD_mm = ID_mm + (2 * d_mm)
+        for l in req.layers:
+            d_mm = l.thickness
+            ID_m = curr_ID_mm / 1000.0
+            OD_m = (curr_ID_mm + 2*d_mm) / 1000.0
             
-            ID_m = ID_mm / 1000.0
-            OD_m = OD_mm / 1000.0
+            # Zapremina cevi
+            vol = (math.pi * L_m * (OD_m**2 - ID_m**2)) / 4
+            w = vol * l.density
+            c = (w/1000.0) * l.price
             
-            vol_m3 = (math.pi * L_m * (OD_m**2 - ID_m**2)) / 4
+            # Površina (unutrašnja)
+            area = math.pi * ID_m * L_m
             
-            ID_disp = ID_mm
-            OD_disp = OD_mm
-            current_ID_mm = OD_mm # Pomeramo granicu
-            final_shell_diameter = OD_mm
+            bom.append({
+                "name": l.material,
+                "th": d_mm,
+                "id": round(curr_ID_mm),
+                "od": round(curr_ID_mm + 2*d_mm),
+                "area": round(area, 2),
+                "vol": round(vol, 3),
+                "w": round(w, 1),
+                "cost": round(c, 2)
+            })
+            tot_w += w
+            tot_c += c
+            curr_ID_mm += 2*d_mm
 
-        elif req.shape == "flat":
-            # RAVNA PLOČA
-            vol_m3 = Flat_Area_m2 * d_m
-            ID_disp = 0 # Nema prečnika
-            OD_disp = 0
-
-        # --- Masa i Cena ---
-        weight_kg = vol_m3 * layer["density"]
-        cost_eur = (weight_kg / 1000.0) * layer["price"]
+    # Ako je RAVNI ZID (FLAT)
+    else:
+        Area_m2 = req.geometry.dim1 # Ovo je sada površina
         
-        total_weight += weight_kg
-        total_cost += cost_eur
-        
-        bill_of_materials.append({
-            "name": layer["material"],
-            "thickness_mm": d_mm,
-            "ID_mm": round(ID_disp, 0) if req.shape == "cylinder" else "-",
-            "OD_mm": round(OD_disp, 0) if req.shape == "cylinder" else "-",
-            "vol_m3": round(vol_m3, 3),
-            "density": layer["density"],
-            "weight_kg": round(weight_kg, 1),
-            "price_per_ton": layer["price"],
-            "total_cost": round(cost_eur, 2)
-        })
+        for l in req.layers:
+            d_mm = l.thickness
+            vol = Area_m2 * (d_mm / 1000.0)
+            w = vol * l.density
+            c = (w/1000.0) * l.price
+            
+            bom.append({
+                "name": l.material,
+                "th": d_mm,
+                "id": "-", # Nema prečnika
+                "od": "-", 
+                "area": Area_m2,
+                "vol": round(vol, 3),
+                "w": round(w, 1),
+                "cost": round(c, 2)
+            })
+            tot_w += w
+            tot_c += c
 
     return {
-        "status": "success",
-        "shell_temp": shell_temp,
-        "heat_flux": heat_flux,
-        "profile": profile,
-        "layers_viz": analyzed_layers,
-        "geometry": {
-            "bill_of_materials": bill_of_materials,
-            "total_weight_kg": round(total_weight, 1),
-            "total_cost_eur": round(total_cost, 2),
-            "req_shell_diameter_mm": round(final_shell_diameter, 1) if req.shape == "cylinder" else 0
-        }
+        "shell_temp": shell_t,
+        "heat_flux": flux,
+        "profile": prof,
+        "total_weight": round(tot_w, 1),
+        "total_cost": round(tot_c, 2),
+        "bom": bom,
+        "req_shell": bom[-1]["od"] if req.geometry.type == "cylinder" else "-"
     }
+
+# --- SEARCH MATERIJALA ---
+@app.get("/api/materials")
+def get_mats():
+    # Hardkodovano da ne zavisimo od PDF-ova ako puknu
+    return [
+        {"name":"CALDE CAST F 60", "density":2450, "lambda_val":1.8, "price":950},
+        {"name":"CALDE CAST M 50", "density":2200, "lambda_val":1.6, "price":850},
+        {"name":"CALDE INSUL 1000", "density":800, "lambda_val":0.2, "price":450},
+        {"name":"CALDE CAST S 80", "density":2800, "lambda_val":2.5, "price":1200},
+        {"name":"SILICA BRICK", "density":1800, "lambda_val":1.1, "price":600}
+    ]
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
