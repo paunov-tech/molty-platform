@@ -167,10 +167,12 @@ function stepApplyTds(parsedResults) {
   const seenMats = new Set();
 
   for (const { file, parsed } of parsedResults) {
-    if (!parsed || parsed.type !== "tds") continue;
-    
-    const matName = parsed.materialName;
-    if (!matName || seenMats.has(matName.toLowerCase())) continue;
+    if (!parsed) continue;
+    // Accept if it has materialName (TDS) regardless of type field
+    const matName = parsed.materialName || parsed.material_name || parsed.name;
+    if (!matName) continue;
+    console.log(`[TDS APPLY] ${file.name} → ${matName} (type=${parsed.type})`);
+    if (seenMats.has(matName.toLowerCase())) continue;
     seenMats.add(matName.toLowerCase());
 
     // Build material record
@@ -536,7 +538,10 @@ export default function Sync() {
 
         setPhase("applying");
         setProgress("💾 Ažuriram materijale...");
-        const changes = stepApplyTds(parsed.filter(r => r.parsed));
+        const successParsed = parsed.filter(r => r.parsed);
+        console.log(`[TDS] Parsed: ${parsed.length}, Success: ${successParsed.length}, Errors: ${parsed.filter(r=>r.error).length}`);
+        if (successParsed.length > 0) console.log(`[TDS] Sample:`, JSON.stringify(successParsed[0].parsed).slice(0, 200));
+        const changes = stepApplyTds(successParsed);
 
         setFeed([...changes, ...newFeed]);
         setStats({
