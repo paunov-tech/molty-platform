@@ -1,10 +1,10 @@
 // ═══════════════════════════════════════════════════
-// MOLTY API: Google Drive Sync v5 — CLEAN
-// Searches ONLY under COMMERCIAL folder tree
+// MOLTY API: Google Drive Sync v6 — Commercial + TDS
 // ═══════════════════════════════════════════════════
 import { google } from 'googleapis';
 
 const COMMERCIAL_FOLDER = process.env.COMMERCIAL_FOLDER_ID || '1zsDeckOseY0gMerBHU8nG0p-qKXDV8bN';
+const ROOT_FOLDER = process.env.CALDERYS_ROOT_FOLDER_ID || '1udwOxXmYlYQAhWSKh0-An7GY53mPeiFE';
 
 function getDrive() {
   const raw = process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
@@ -135,6 +135,115 @@ async function recentFiles() {
   };
 }
 
+// ── TDS: Search CALDE technical data sheets across entire Drive ──
+async function tdsFiles() {
+  const drive = getDrive();
+
+  // CALDE TDS queries — targeted patterns
+  const queries = [
+    // Explicit TDS + CALDE
+    "name contains 'TDS' and name contains 'CALDE'",
+    "name contains 'TDS' and name contains 'CAST'",
+    "name contains 'TDS' and name contains 'GUN'",
+    "name contains 'TDS' and name contains 'TROWEL'",
+    "name contains 'TDS' and name contains 'PATCH'",
+    "name contains 'TDS' and name contains 'MIX' and name contains 'SILICA'",
+    "name contains 'TDS' and name contains 'PLAST'",
+    "name contains 'TDS' and name contains 'FLOW'",
+    "name contains 'TDS' and name contains 'ERMAG'",
+    "name contains 'TDS' and name contains 'ERSPIN'",
+    // Coded filenames (calde_cast_xxx_tds)
+    "name contains 'calde_cast'",
+    "name contains 'calde_gun'",
+    "name contains 'calde_mix'",
+    "name contains 'calde_trowel'",
+    "name contains 'calde_patch'",
+    "name contains 'calde_flow'",
+    "name contains 'calde_plast'",
+    "name contains 'calde_mag'",
+    "name contains 'calde_sol'",
+    "name contains 'calde_spraycast'",
+    "name contains 'calde_ram'",
+    "name contains 'alkon_cast'",
+    "name contains 'alkon_gun'",
+    "name contains 'alkon_plast'",
+    // SOL CAST
+    "name contains 'TDS' and name contains 'SOL'",
+    "name contains 'CALDE' and name contains 'CAST' and name contains 'DESCRIPTION'",
+  ];
+
+  const allFiles = new Map();
+  const runQuery = async (filter) => {
+    const q = `${filter} and trashed = false and mimeType != 'application/vnd.google-apps.folder'`;
+    let pt = null;
+    do {
+      const r = await drive.files.list({
+        q, fields: 'nextPageToken, files(id, name, mimeType, modifiedTime, size, parents)',
+        pageSize: 500, pageToken: pt || undefined,
+      });
+      for (const f of (r.data.files || [])) {
+        if (!allFiles.has(f.id)) allFiles.set(f.id, f);
+      }
+      pt = r.data.nextPageToken;
+    } while (pt);
+  };
+
+  for (let i = 0; i < queries.length; i += 10) {
+    await Promise.all(queries.slice(i, i + 10).map(q => runQuery(q)));
+  }
+
+  // Filter: ONLY CALDE products, exclude MSDS/SDS, exclude non-Calderys
+  const exclude = /\b(msds|sds|bezbednosni|safety)\b/i;
+  const excludeBrand = /\b(opal|porit|zvezda|superior|durharc|korunit|durafix|special\s*scm)\b/i;
+  
+  const filtered = [...allFiles.values()].filter(f => {
+    const n = f.name.toLowerCase();
+    // Must be PDF or Google Doc
+    if (f.mimeType !== 'application/pdf' && !f.mimeType?.includes('document')) return false;
+    // Exclude MSDS/SDS safety data sheets
+    if (exclude.test(f.name)) return false;
+    // Exclude non-Calderys brands
+    if (excludeBrand.test(f.name)) return false;
+    // Must contain CALDE or be a coded calde_ filename or alkon_
+    const hasCalde = n.includes('calde') || n.includes('alkon');
+    const hasTDS = n.includes('tds') || n.includes('_tds_');
+    if (!hasCalde) return false;
+    // Coded files without TDS keyword are OK (they ARE TDS files by naming convention)
+    if (n.startsWith('calde_') || n.startsWith('alkon_')) return true;
+    // Named files should have TDS or description
+    return hasTDS || n.includes('description');
+  });
+
+  // Get parent folder names for context
+  const parentIds = [...new Set(filtered.map(f => f.parents?.[0]).filter(Boolean))];
+  const folderNames = {};
+  for (let i = 0; i < parentIds.length; i += 50) {
+    const batch = parentIds.slice(i, i + 50);
+    await Promise.all(batch.map(async (pid) => {
+      try {
+        const r = await drive.files.get({ fileId: pid, fields: 'id,name' });
+        folderNames[pid] = r.data.name;
+      } catch { folderNames[pid] = 'Unknown'; }
+    }));
+  }
+
+  const enriched = filtered.map(f => ({
+    id: f.id, name: f.name, mimeType: f.mimeType,
+    modifiedTime: f.modifiedTime, size: f.size,
+    parentId: f.parents?.[0],
+    folder: folderNames[f.parents?.[0]] || 'Root',
+    _docType: 'tds',
+  }));
+
+  enriched.sort((a, b) => a.name.localeCompare(b.name));
+
+  return {
+    success: true, count: enriched.length,
+    files: enriched,
+    folders: [...new Set(enriched.map(f => f.folder))].sort(),
+  };
+}
+
 // ── Handler ──
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ success: false, error: 'GET only' });
@@ -144,6 +253,7 @@ export default async function handler(req, res) {
     switch (mode) {
       case 'health':  result = await healthCheck(); break;
       case 'recent':  result = await recentFiles(); break;
+      case 'tds':     result = await tdsFiles(); break;
       default: return res.status(400).json({ success: false, error: `Unknown mode: ${mode}` });
     }
     return res.status(200).json(result);

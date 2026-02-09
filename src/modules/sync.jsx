@@ -13,10 +13,9 @@ const api = async (mode, params = {}) => {
   const r = await fetch(`/api/drive-sync?${qs}`);
   return r.json();
 };
-const parseDoc = async (docId) => {
-  const r = await fetch(`/api/parse-doc?docId=${docId}`);
+const parseDoc = async (docId, docType = "commercial") => {
+  const r = await fetch(`/api/parse-doc?docId=${docId}&docType=${docType}`);
   if (!r.ok) {
-    // Try to get error message from response
     try {
       const err = await r.json();
       return { success: false, message: err.error || `HTTP ${r.status}` };
@@ -116,21 +115,20 @@ function stepFilter(files) {
   }).map(f => ({ ...f, _docType: f._docType || "commercial" }));
 }
 
-async function stepParse(docs, onProgress) {
+async function stepParse(docs, onProgress, docType = "commercial") {
   const results = [];
-  let delay = 1200; // start 1.2s between calls
+  let delay = 1200;
   for (let i = 0; i < docs.length; i++) {
     onProgress(i + 1, docs.length, docs[i].name);
     
-    // Retry loop with exponential backoff for 429
     let retries = 0;
     const MAX_RETRIES = 3;
     while (retries <= MAX_RETRIES) {
       try {
-        const res = await parseDoc(docs[i].id);
+        const res = await parseDoc(docs[i].id, docType);
         if (res.success && res.parsed) {
           results.push({ file: docs[i], parsed: res.parsed });
-          delay = Math.max(1200, delay * 0.9); // ease back down on success
+          delay = Math.max(1200, delay * 0.9);
           break;
         } else if (res.error && res.error.includes("429")) {
           retries++;
@@ -138,10 +136,10 @@ async function stepParse(docs, onProgress) {
             results.push({ file: docs[i], error: res.error });
             break;
           }
-          const wait = Math.min(90000, 15000 * Math.pow(2, retries - 1)); // 15s, 30s, 60s
+          const wait = Math.min(90000, 15000 * Math.pow(2, retries - 1));
           onProgress(i + 1, docs.length, `⏳ Rate limit — čekam ${Math.round(wait/1000)}s... (${docs[i].name})`);
           await new Promise(r => setTimeout(r, wait));
-          delay = Math.min(3000, delay * 1.5); // slow down future calls
+          delay = Math.min(3000, delay * 1.5);
         } else {
           results.push({ file: docs[i], error: res.message || res.error || "No data" });
           break;
@@ -155,6 +153,70 @@ async function stepParse(docs, onProgress) {
     if (i < docs.length - 1) await new Promise(r => setTimeout(r, delay));
   }
   return results;
+}
+
+// ═══ TDS PIPELINE ═══
+async function stepScanTds() {
+  const res = await api("tds");
+  if (!res.success) throw new Error(res.error || "TDS scan failed");
+  return res;
+}
+
+function stepApplyTds(parsedResults) {
+  const changes = [];
+  const seenMats = new Set();
+
+  for (const { file, parsed } of parsedResults) {
+    if (!parsed || parsed.type !== "tds") continue;
+    
+    const matName = parsed.materialName;
+    if (!matName || seenMats.has(matName.toLowerCase())) continue;
+    seenMats.add(matName.toLowerCase());
+
+    // Build material record
+    const tdsData = {
+      name: matName,
+      productCode: parsed.productCode || null,
+      brand: parsed.brand || "Calderys",
+      category: parsed.category || "other",
+      application: parsed.application || "",
+      installMethod: parsed.installMethod || null,
+      maxTemp: parsed.maxServiceTemp || null,
+      density: parsed.density || null,
+      crushingStrength: parsed.crushingStrength || null,
+      porosity: parsed.porosity || null,
+      thermalConductivity: parsed.thermalConductivity || null,
+      chemistry: parsed.chemicalComposition || {},
+      grainSize: parsed.grainSize || null,
+      waterAddition: parsed.waterAddition || null,
+      shelfLife: parsed.shelfLife || null,
+      packaging: parsed.packaging || null,
+      driveFileId: file.id,
+      driveFileName: file.name,
+      driveFolder: file.folder || "",
+      source: "tds-sync",
+      syncDate: new Date().toISOString().slice(0, 10),
+    };
+
+    // Check if material exists
+    const materials = store.getAll("materials");
+    const existing = materials.find(m => {
+      const n1 = (m.name || "").toLowerCase().replace(/[®™\s]+/g, " ").trim();
+      const n2 = matName.toLowerCase().replace(/[®™\s]+/g, " ").trim();
+      return n1 === n2 || n1.includes(n2) || n2.includes(n1);
+    });
+
+    if (existing) {
+      store.update("materials", existing.id, tdsData);
+      changes.push({ type: "tds_update", material: matName, category: tdsData.category, maxTemp: tdsData.maxTemp, source: file.name });
+    } else {
+      store.add("materials", tdsData);
+      changes.push({ type: "tds_new", material: matName, category: tdsData.category, maxTemp: tdsData.maxTemp, source: file.name });
+    }
+  }
+
+  store.log("tds_sync", { materials: changes.length, timestamp: new Date().toISOString().slice(0, 10) });
+  return changes;
 }
 
 function stepApply(parsedResults, customers) {
@@ -340,6 +402,38 @@ function FeedItem({ item }) {
       </div>
     </div>
   );
+  if (item.type === "tds_new") return (
+    <div style={s}>
+      <span style={{ fontSize: 18 }}>📋</span>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: C.cy }}>
+          + {item.material}
+        </div>
+        <div style={{ fontSize: 10, color: C.txM, marginTop: 2 }}>
+          {item.category && <span style={{ color: C.pu }}>🏷 {item.category} · </span>}
+          {item.maxTemp && <span style={{ color: C.or }}>🌡 {item.maxTemp}°C · </span>}
+          Novi TDS
+        </div>
+        <div style={{ fontSize: 9, color: C.txD, marginTop: 2 }}>iz: {item.source}</div>
+      </div>
+    </div>
+  );
+  if (item.type === "tds_update") return (
+    <div style={s}>
+      <span style={{ fontSize: 18 }}>🔬</span>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: C.bl }}>
+          ↻ {item.material}
+        </div>
+        <div style={{ fontSize: 10, color: C.txM, marginTop: 2 }}>
+          {item.category && <span style={{ color: C.pu }}>🏷 {item.category} · </span>}
+          {item.maxTemp && <span style={{ color: C.or }}>🌡 {item.maxTemp}°C · </span>}
+          TDS ažuriran
+        </div>
+        <div style={{ fontSize: 9, color: C.txD, marginTop: 2 }}>iz: {item.source}</div>
+      </div>
+    </div>
+  );
   if (item.type === "new_file") return (
     <div style={s}>
       <span style={{ fontSize: 14 }}>{mimeIcon(item.mimeType)}</span>
@@ -394,6 +488,76 @@ export default function Sync() {
     const newFeed = [];
 
     try {
+      // ── TDS MODE ──
+      if (mode === "tds" || mode === "tds-scan") {
+        setPhase("scanning");
+        setProgress("📡 Skeniram TDS fajlove (CALDE materijali)...");
+        const scanRes = await stepScanTds();
+
+        for (const f of scanRes.files || []) {
+          newFeed.push({
+            type: "new_file", name: f.name, folder: f.folder,
+            mimeType: f.mimeType, modified: f.modifiedTime,
+          });
+        }
+
+        if (abortRef.current) { setPhase("idle"); return; }
+        
+        const parseableFiles = (scanRes.files || []).filter(f => isParseable(f.mimeType));
+        
+        if (mode === "tds-scan") {
+          setFeed(newFeed);
+          setStats({ totalFiles: scanRes.count, folders: (scanRes.folders || []).length, docsFound: parseableFiles.length, parsed: 0, errors: 0, customerUpdates: 0, newMaterials: 0, tdsMaterials: 0 });
+          setPhase("done");
+          return;
+        }
+
+        // Cap TDS parsing at 100
+        const MAX_TDS = 100;
+        let toParse = parseableFiles;
+        let cappedMsg = "";
+        if (parseableFiles.length > MAX_TDS) {
+          toParse = parseableFiles.slice(0, MAX_TDS);
+          cappedMsg = ` ⚠️ Ograničeno na ${MAX_TDS}`;
+        }
+
+        setProgress(`📋 ${toParse.length} CALDE TDS fajlova${cappedMsg}`);
+        await new Promise(r => setTimeout(r, 1500));
+
+        setPhase("parsing");
+        const parsed = await stepParse(toParse, (cur, tot, name) => {
+          setProgress(`🔬 TDS ${cur}/${tot}: ${name}`);
+        }, "tds");
+        if (abortRef.current) { setPhase("idle"); return; }
+
+        for (const r of parsed) {
+          if (r.error) newFeed.unshift({ type: "parse_error", name: r.file.name, error: r.error });
+        }
+
+        setPhase("applying");
+        setProgress("💾 Ažuriram materijale...");
+        const changes = stepApplyTds(parsed.filter(r => r.parsed));
+
+        setFeed([...changes, ...newFeed]);
+        setStats({
+          totalFiles: scanRes.count, folders: (scanRes.folders || []).length,
+          docsFound: toParse.length,
+          parsed: parsed.filter(r => r.parsed).length,
+          errors: parsed.filter(r => r.error).length,
+          customerUpdates: 0,
+          newMaterials: 0,
+          tdsMaterials: changes.length,
+        });
+
+        const now = new Date().toISOString();
+        setLastSync(now);
+        try { localStorage.setItem("molty_last_sync", now); } catch {}
+        setPhase("done");
+        setProgress("");
+        return;
+      }
+
+      // ── COMMERCIAL MODE (existing) ──
       setPhase("scanning");
       setProgress("📡 Skeniram COMMERCIAL folder (2021-2026)...");
       const scanRes = await stepScan();
@@ -529,13 +693,14 @@ export default function Sync() {
           <Stat label="Parsirano" value={stats.parsed} sub={stats.errors > 0 ? `${stats.errors} err` : ""} icon="🧠" color={C.pu} />
           <Stat label="Kupci" value={stats.customerUpdates} icon="🏭" color={C.gr} />
           <Stat label="Materijali" value={stats.newMaterials} icon="🧱" color={C.cy} />
+          {stats.tdsMaterials > 0 && <Stat label="TDS" value={stats.tdsMaterials} icon="🔬" color={C.cy} />}
         </div>
       )}
 
       {/* Controls */}
       <Card style={{ marginBottom: 14 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <span style={{ fontSize: 10, color: C.txD }}>Komercijalni dokumenti 2021-2026</span>
+          <span style={{ fontSize: 10, color: C.txD }}>Komercijalni 2021-2026</span>
           <div style={{ flex: 1 }} />
           {isRunning
             ? <button onClick={abort} style={{ padding: "8px 16px", borderRadius: 6, border: `1px solid ${C.rd}55`,
@@ -547,6 +712,18 @@ export default function Sync() {
                   background: C.bl + "15", color: C.bl, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>👁 Skeniraj</button>
               </>
           }
+        </div>
+      </Card>
+      <Card style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 10, color: C.txD }}>📋 TDS — Tehnički listovi (CALDE)</span>
+          <div style={{ flex: 1 }} />
+          {!isRunning && <>
+            <button onClick={() => runSync("tds")} style={{ padding: "8px 16px", borderRadius: 6, border: `1px solid ${C.cy}55`,
+              background: C.cy + "15", color: C.cy, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>🔬 TDS SYNC</button>
+            <button onClick={() => runSync("tds-scan")} style={{ padding: "8px 16px", borderRadius: 6, border: `1px solid ${C.pu}55`,
+              background: C.pu + "15", color: C.pu, fontSize: 12, fontWeight: 700, cursor: "pointer" }}>👁 TDS Skeniraj</button>
+          </>}
         </div>
       </Card>
 
@@ -573,10 +750,10 @@ export default function Sync() {
       {/* Feed */}
       {feed.length > 0 && (
         <div>
-          {feed.some(f => f.type === "customer_update" || f.type === "new_customer" || f.type === "new_material" || f.type === "material_update") && (
+          {feed.some(f => f.type === "customer_update" || f.type === "new_customer" || f.type === "new_material" || f.type === "material_update" || f.type === "tds_new" || f.type === "tds_update") && (
             <Card style={{ marginBottom: 10, borderColor: C.gr + "33" }}>
-              <SectionTitle>✅ Promene ({feed.filter(f => f.type === "customer_update" || f.type === "new_customer" || f.type === "new_material" || f.type === "material_update").length})</SectionTitle>
-              {feed.filter(f => f.type === "customer_update" || f.type === "new_customer" || f.type === "new_material" || f.type === "material_update").map((item, i) => <FeedItem key={`c${i}`} item={item} />)}
+              <SectionTitle>✅ Promene ({feed.filter(f => f.type === "customer_update" || f.type === "new_customer" || f.type === "new_material" || f.type === "material_update" || f.type === "tds_new" || f.type === "tds_update").length})</SectionTitle>
+              {feed.filter(f => f.type === "customer_update" || f.type === "new_customer" || f.type === "new_material" || f.type === "material_update" || f.type === "tds_new" || f.type === "tds_update").map((item, i) => <FeedItem key={`c${i}`} item={item} />)}
             </Card>
           )}
           {feed.some(f => f.type === "parse_error") && (
@@ -614,7 +791,8 @@ export default function Sync() {
           <div style={{ fontSize: 13, color: C.tx, fontWeight: 600, marginBottom: 4 }}>Auto Sync Pipeline</div>
           <div style={{ fontSize: 11, color: C.txM, lineHeight: 1.6 }}>
             📡 Skenira Drive → 🧠 Parsira Invoice/Offer/Rechnung/Angebot (2021+) → 🏭 Ažurira kupce<br/>
-            <span style={{ color: C.or, fontWeight: 700 }}>⚡ AUTO SYNC</span> za kompletan pipeline · <span style={{ color: C.bl, fontWeight: 700 }}>👁 Skeniraj</span> samo da vidiš fajlove
+            🔬 TDS Sync: Skenira CALDE tehničke listove → 📋 Izvlači specifikacije → 🧱 Povezuje materijale<br/>
+            <span style={{ color: C.or, fontWeight: 700 }}>⚡ AUTO SYNC</span> za fakture · <span style={{ color: C.cy, fontWeight: 700 }}>🔬 TDS SYNC</span> za tehničke listove
           </div>
         </Card>
       )}

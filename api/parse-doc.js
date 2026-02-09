@@ -51,11 +51,11 @@ async function getPdfBase64(drive, docId) {
 }
 
 // ── Call Claude API ──
-async function callClaude(content, fileName) {
+async function callClaude(content, fileName, docType) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
 
-  const prompt = buildPrompt(fileName);
+  const prompt = buildPrompt(fileName, docType || 'commercial');
 
   // Content can be text string or PDF base64
   let messages;
@@ -95,8 +95,13 @@ async function callClaude(content, fileName) {
   return JSON.parse(jsonMatch[0]);
 }
 
-// ── Prompt ──
-function buildPrompt(fileName) {
+// ── Prompts ──
+function buildPrompt(fileName, docType) {
+  if (docType === 'tds') return buildTdsPrompt(fileName);
+  return buildCommercialPrompt(fileName);
+}
+
+function buildCommercialPrompt(fileName) {
   return `Analiziraj ovaj poslovni dokument (faktura/ponuda) iz industrije vatrostalnih materijala.
 Ime fajla: ${fileName}
 
@@ -130,11 +135,52 @@ Odgovori ISKLJUČIVO u JSON formatu:
 Odgovori SAMO JSON, bez dodatnog teksta.`;
 }
 
+function buildTdsPrompt(fileName) {
+  return `Ovo je Technical Data Sheet (TDS) vatrostalnog materijala kompanije Calderys.
+Ime fajla: ${fileName}
+
+Izvuci SVE tehničke podatke iz dokumenta. Odgovori ISKLJUČIVO u JSON formatu:
+{
+  "type": "tds",
+  "materialName": "pun naziv materijala (npr. CALDE CAST M 32)",
+  "productCode": "interni kod ako postoji (npr. MAF40050) or null",
+  "brand": "Calderys|Alkon|other",
+  "category": "castable|gunning|ramming|trowelling|patching|flow|spray|plaster|mix|brick|other",
+  "application": "kratak opis primene (npr. steel ladle lining, induction furnace, tundish)",
+  "installMethod": "casting|gunning|ramming|trowelling|patching|spraying|vibrating|other|null",
+  "maxServiceTemp": number_celsius_or_null,
+  "maxServiceTempUnit": "°C",
+  "density": number_kg_m3_or_null,
+  "crushingStrength": { "value": number_or_null, "unit": "MPa|N/mm²|null", "temp": "°C at which measured or null" },
+  "porosity": number_percent_or_null,
+  "thermalConductivity": { "value": number_or_null, "unit": "W/mK", "temp": number_celsius_or_null },
+  "chemicalComposition": {
+    "Al2O3": number_percent_or_null,
+    "SiO2": number_percent_or_null,
+    "Fe2O3": number_percent_or_null,
+    "CaO": number_percent_or_null,
+    "MgO": number_percent_or_null,
+    "Cr2O3": number_percent_or_null,
+    "ZrO2": number_percent_or_null,
+    "SiC": number_percent_or_null,
+    "C": number_percent_or_null
+  },
+  "grainSize": "max grain size string or null (e.g. 0-6mm)",
+  "waterAddition": "percentage range string or null (e.g. 5.5-6.5%)",
+  "shelfLife": "string or null (e.g. 12 months)",
+  "packaging": "string or null (e.g. 25kg bags, 1000kg big bags)"
+}
+
+VAŽNO: Izvuci sve hemijske komponente koje su navedene, ne samo Al2O3 i SiO2. 
+Ako vrednost nije navedena, stavi null.
+Odgovori SAMO JSON, bez dodatnog teksta.`;
+}
+
 // ── Handler — NEVER returns 500 ──
 export default async function handler(req, res) {
   if (req.method !== 'GET') return res.status(200).json({ success: false, error: 'GET only' });
 
-  const { docId, test } = req.query;
+  const { docId, test, docType } = req.query;
   if (!docId) return res.status(200).json({ success: false, error: 'Missing docId' });
 
   try {
@@ -151,14 +197,13 @@ export default async function handler(req, res) {
 
     if (mimeType === 'application/pdf') {
       const b64 = await getPdfBase64(drive, docId);
-      parsed = await callClaude(b64, name);
+      parsed = await callClaude(b64, name, docType);
     } else {
-      // Google Doc, Sheet, or text — export as text
       const text = await getFileAsText(drive, docId, mimeType);
       if (!text || text.length < 10) {
         return res.status(200).json({ success: true, parsed: null, message: 'Prazan dokument', fileName: name });
       }
-      parsed = await callClaude(text, name);
+      parsed = await callClaude(text, name, docType);
     }
 
     return res.status(200).json({ success: true, parsed, fileName: name, mimeType });
