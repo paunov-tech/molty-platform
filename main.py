@@ -1,14 +1,14 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import List
 import uvicorn
 import os
 import re
 import PyPDF2
+import math
 
-app = FastAPI(title="MOLTY THERMAL CORE v3")
+app = FastAPI(title="MOLTY ULTIMATE")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,110 +17,80 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ⚠️ OVO JE KLJUČNO - Putanja do foldera
-# Pokušavamo da nađemo folder gde god da je
+# --- MATERIJALI ---
 CURRENT_DIR = os.getcwd()
 PDF_FOLDER = os.path.join(CURRENT_DIR, "tehnicki_listovi")
 
-# ---------------------------------------------------------
-# 🧠 NAPREDNI SKENER (KOJI NE ODUSTAJE)
-# ---------------------------------------------------------
+def estimate_price(name, density):
+    name_upper = name.upper()
+    if "INSUL" in name_upper: return 450.0 
+    if density > 2800: return 1200.0 
+    if "CAST" in name_upper: return 850.0 
+    return 600.0 
+
 def scan_local_materials():
     materials = []
-    
-    # PROVERA FOLDERA
     if not os.path.exists(PDF_FOLDER):
-        print(f"❌ GREŠKA: Folder nije pronađen na putanji: {PDF_FOLDER}")
-        print("👉 Savet: Proveri da li se folder zove 'tehnicki_listovi' (tačno tako)")
-        return []
-
-    print(f"📂 Skeniram folder: {PDF_FOLDER}")
-    files = os.listdir(PDF_FOLDER)
-    print(f"📄 Pronađeno fajlova: {len(files)}")
+        return [
+            {"name": "CALDE CAST F 60", "category": "working", "density": 2450, "lambda_val": 1.6, "price": 950},
+            {"name": "CALDE INSUL 1000", "category": "insulation", "density": 800, "lambda_val": 0.2, "price": 450}
+        ]
     
-    for filename in files:
+    for filename in os.listdir(PDF_FOLDER):
         if filename.lower().endswith(".pdf"):
-            # Podrazumevane vrednosti (Fallback)
             mat_name = filename.replace(".pdf", "").replace(".PDF", "").replace("_", " ")
-            category = "working"
-            lambda_val = 1.5
-            density = 2400
-
+            category, lambda_val, density = "working", 1.5, 2400
             try:
-                # Pokušavamo da izvučemo pametne podatke
-                file_path = os.path.join(PDF_FOLDER, filename)
-                reader = PyPDF2.PdfReader(file_path)
-                
-                # Čitamo samo prvu stranu da uštedimo vreme
-                text = reader.pages[0].extract_text() or "" 
-                
-                # --- Detekcija Gustine ---
-                dens_match = re.search(r"(\d+[.,]\d+)\s*(g/cm3|kg/dm3)", text)
-                if dens_match:
-                    val = float(dens_match.group(1).replace(",", "."))
-                    if val < 10: density = val * 1000
-                    else: density = val
-                
-                # --- Detekcija Kategorije ---
-                text_upper = text.upper()
-                if density < 1600 or "INSUL" in text_upper or "LIGHT" in text_upper or "IZOL" in text_upper:
-                    category = "insulation"
-                    lambda_val = 0.2
-                elif "GUN" in text_upper or "SPRAY" in text_upper:
-                    category = "working"
-                    lambda_val = 1.8
-                elif "CAST" in text_upper:
-                    lambda_val = 1.6
-
-                print(f"✅ Učitan: {mat_name} (L={lambda_val}, D={density})")
-
-            except Exception as e:
-                # Ako ne možemo da pročitamo PDF, IPAK GA DODAJEMO u listu!
-                print(f"⚠️ Nije pročitana fizika za {filename}, koristim default vrednosti.")
+                reader = PyPDF2.PdfReader(os.path.join(PDF_FOLDER, filename))
+                if len(reader.pages) > 0:
+                    text = reader.pages[0].extract_text() or ""
+                    dm = re.search(r"(\d+[.,]\d+)\s*(g/cm3|kg/dm3)", text)
+                    if dm:
+                        val = float(dm.group(1).replace(",", "."))
+                        density = val * 1000 if val < 10 else val
+                    if density < 1600 or "INSUL" in text.upper():
+                        category = "insulation"
+                        lambda_val = 0.2
+            except: pass
             
-            # DODAJ U LISTU BEZ OBZIRA NA SVE
             materials.append({
-                "name": mat_name,
-                "category": category,
-                "density": int(density),
+                "name": mat_name, 
+                "category": category, 
+                "density": int(density), 
                 "lambda_val": round(lambda_val, 2),
-                "filename": filename
+                "price": estimate_price(mat_name, density)
             })
-    
     materials.sort(key=lambda x: x["name"])
     return materials
 
-# Učitaj odmah
-CACHED_MATERIALS = []
+CACHED_MATERIALS = scan_local_materials()
 
-@app.on_event("startup")
-def startup_event():
-    global CACHED_MATERIALS
-    CACHED_MATERIALS = scan_local_materials()
-
-# ---------------------------------------------------------
-# 🔌 API
-# ---------------------------------------------------------
-
-@app.get("/api/materials")
-def get_materials():
-    return CACHED_MATERIALS
-
+# --- MODELI ---
 class LayerInput(BaseModel):
-    type: str
     material: str
     thickness: int
     lambda_val: float
+    density: float
+    price: float 
 
 class SimulationRequest(BaseModel):
     target_temp: int
     ambient_temp: int
     layers: List[LayerInput]
+    
+    # GEOMETRIJA
+    shape: str       # "cylinder", "flat", "cone"...
+    dim1: float      # Dužina (mm) ILI Površina (m2) ako je flat
+    dim2: float      # Svetli Otvor (mm) - samo za cilindre
+
+@app.get("/api/materials")
+def get_materials():
+    return CACHED_MATERIALS
 
 @app.post("/api/simulate")
-def calculate_heat_transfer(req: SimulationRequest):
-    total_resistance = 0
-    r_surface_air = 0.1 
+def calculate(req: SimulationRequest):
+    # 1. TERMIKA
+    total_resistance = 0.1
     analyzed_layers = []
     
     for layer in req.layers:
@@ -128,37 +98,96 @@ def calculate_heat_transfer(req: SimulationRequest):
         lam = layer.lambda_val if layer.lambda_val > 0 else 1.0
         r_th = d_m / lam
         total_resistance += r_th
-        analyzed_layers.append({
-            "name": layer.material, "d_mm": layer.thickness, "lambda": lam, "r_val": r_th
-        })
+        analyzed_layers.append(layer.dict())
 
-    total_resistance += r_surface_air
     delta_t = req.target_temp - req.ambient_temp
-    heat_flux = delta_t / total_resistance
+    heat_flux = round(delta_t / total_resistance, 2)
     
-    current_temp = req.target_temp
-    profile = [{"pos": 0, "temp": round(current_temp), "label": "Hot Face"}]
+    curr_t = req.target_temp
+    profile = [{"pos": 0, "temp": round(curr_t)}]
     acc_th = 0
+    for l in analyzed_layers:
+        r_val = (l["thickness"]/1000.0) / (l["lambda_val"] if l["lambda_val"]>0 else 1)
+        curr_t -= heat_flux * r_val
+        acc_th += l["thickness"]
+        profile.append({"pos": acc_th, "temp": round(curr_t)})
+    shell_temp = round(curr_t, 1)
+
+    # 2. GEOMETRIJA (RAZLIKOVANJE OBLIKA)
+    bill_of_materials = []
+    total_weight = 0
+    total_cost = 0
+    
+    # Promenljive za cilindar
+    L_m = req.dim1 / 1000.0 # Dužina u metrima
+    current_ID_mm = req.dim2 # Svetli otvor u mm
+    
+    # Promenljiva za Flat
+    Flat_Area_m2 = req.dim1 # Ovde dim1 glumim površinu u m2
+    
+    final_shell_diameter = 0
 
     for layer in analyzed_layers:
-        dt = heat_flux * layer["r_val"]
-        current_temp -= dt
-        acc_th += layer["d_mm"]
-        profile.append({"pos": acc_th, "temp": round(current_temp), "label": "Spoj"})
+        d_mm = layer["thickness"]
+        d_m = d_mm / 1000.0
+        
+        vol_m3 = 0
+        ID_disp = 0
+        OD_disp = 0
+
+        if req.shape == "cylinder":
+            # CILINDAR (Inside-Out)
+            ID_mm = current_ID_mm
+            OD_mm = ID_mm + (2 * d_mm)
+            
+            ID_m = ID_mm / 1000.0
+            OD_m = OD_mm / 1000.0
+            
+            vol_m3 = (math.pi * L_m * (OD_m**2 - ID_m**2)) / 4
+            
+            ID_disp = ID_mm
+            OD_disp = OD_mm
+            current_ID_mm = OD_mm # Pomeramo granicu
+            final_shell_diameter = OD_mm
+
+        elif req.shape == "flat":
+            # RAVNA PLOČA
+            vol_m3 = Flat_Area_m2 * d_m
+            ID_disp = 0 # Nema prečnika
+            OD_disp = 0
+
+        # --- Masa i Cena ---
+        weight_kg = vol_m3 * layer["density"]
+        cost_eur = (weight_kg / 1000.0) * layer["price"]
+        
+        total_weight += weight_kg
+        total_cost += cost_eur
+        
+        bill_of_materials.append({
+            "name": layer["material"],
+            "thickness_mm": d_mm,
+            "ID_mm": round(ID_disp, 0) if req.shape == "cylinder" else "-",
+            "OD_mm": round(OD_disp, 0) if req.shape == "cylinder" else "-",
+            "vol_m3": round(vol_m3, 3),
+            "density": layer["density"],
+            "weight_kg": round(weight_kg, 1),
+            "price_per_ton": layer["price"],
+            "total_cost": round(cost_eur, 2)
+        })
 
     return {
-        "status": "success", "shell_temp": round(current_temp, 1), 
-        "heat_flux": round(heat_flux, 2), "profile": profile, "layers_viz": analyzed_layers
+        "status": "success",
+        "shell_temp": shell_temp,
+        "heat_flux": heat_flux,
+        "profile": profile,
+        "layers_viz": analyzed_layers,
+        "geometry": {
+            "bill_of_materials": bill_of_materials,
+            "total_weight_kg": round(total_weight, 1),
+            "total_cost_eur": round(total_cost, 2),
+            "req_shell_diameter_mm": round(final_shell_diameter, 1) if req.shape == "cylinder" else 0
+        }
     }
-
-@app.get("/", response_class=HTMLResponse)
-def read_root():
-    try:
-        with open("dashboard.html", "r", encoding="utf-8") as f:
-            return f.read()
-    except FileNotFoundError:
-        return "<h1>Nema dashboard.html</h1>"
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
